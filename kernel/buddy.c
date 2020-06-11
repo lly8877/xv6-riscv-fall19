@@ -15,6 +15,7 @@ static int nsizes;     // the number of entries in bd_sizes array
 #define HEAP_SIZE     BLK_SIZE(MAXSIZE) 
 #define NBLK(k)       (1 << (MAXSIZE-k))         // Number of block at size k
 #define ROUNDUP(n,sz) (((((n)-1)/(sz))+1)*(sz))  // Round up to the next multiple of sz
+#define XORTEST
 
 typedef struct list Bd_list;
 
@@ -26,7 +27,10 @@ typedef struct list Bd_list;
 // 8 blocks).
 struct sz_info {
   Bd_list free;
+  #ifdef XORTEST
   char *alloc;
+  #endif
+  char *allocxor;
   char *split;
 };
 typedef struct sz_info Sz_info;
@@ -54,6 +58,22 @@ void bit_clear(char *array, int index) {
   char b = array[index/8];
   char m = (1 << (index % 8));
   array[index/8] = (b & ~m);
+}
+
+// Flip bit at position index in array
+void bit_flip(char *array, int index) {
+  char b = array[index/8];
+  char m = (1 << (index % 8));
+  array[index/8] = (b ^ m);
+}
+
+void check(char *array, char *xorarray, int xorindex) {
+  if (bit_isset(array, xorindex*2) == bit_isset(array, xorindex*2+1) && bit_isset(xorarray, xorindex)) {
+    panic("p1");
+  }
+  if (bit_isset(array, xorindex*2) != bit_isset(array, xorindex*2+1) && bit_isset(xorarray, xorindex)==0) {
+    panic("p2");
+  }
 }
 
 // Print a bit vector as a list of ranges of 1 bits
@@ -84,7 +104,7 @@ bd_print() {
     printf("size %d (blksz %d nblk %d): free list: ", k, BLK_SIZE(k), NBLK(k));
     lst_print(&bd_sizes[k].free);
     printf("  alloc:");
-    bd_print_vector(bd_sizes[k].alloc, NBLK(k));
+    bd_print_vector(bd_sizes[k].allocxor, NBLK(k)/2);
     if(k > 0) {
       printf("  split:");
       bd_print_vector(bd_sizes[k].split, NBLK(k));
@@ -139,13 +159,20 @@ bd_malloc(uint64 nbytes)
 
   // Found a block; pop it and potentially split it.
   char *p = lst_pop(&bd_sizes[k].free);
+  bit_flip(bd_sizes[k].allocxor, blk_index(k, p)/2);
+  #ifdef XORTEST
   bit_set(bd_sizes[k].alloc, blk_index(k, p));
+  check(bd_sizes[k].alloc, bd_sizes[k].allocxor, blk_index(k, p)/2);
+  #endif
   for(; k > fk; k--) {
     // split a block at size k and mark one half allocated at size k-1
     // and put the buddy on the free list at size k-1
     char *q = p + BLK_SIZE(k-1);   // p's buddy
     bit_set(bd_sizes[k].split, blk_index(k, p));
+    #ifdef XORTEST
     bit_set(bd_sizes[k-1].alloc, blk_index(k-1, p));
+    #endif
+    bit_flip(bd_sizes[k-1].allocxor, blk_index(k-1, p)/2);
     lst_push(&bd_sizes[k-1].free, q);
   }
   release(&lock);
@@ -175,8 +202,12 @@ bd_free(void *p) {
   for (k = size(p); k < MAXSIZE; k++) {
     int bi = blk_index(k, p);
     int buddy = (bi % 2 == 0) ? bi+1 : bi-1;
+    #ifdef XORTEST
     bit_clear(bd_sizes[k].alloc, bi);  // free p at size k
-    if (bit_isset(bd_sizes[k].alloc, buddy)) {  // is buddy allocated?
+    #endif
+    bit_flip(bd_sizes[k].allocxor, bi/2);  // free p at size k
+    // if (bit_isset(bd_sizes[k].alloc, buddy)) {  // is buddy allocated?
+    if (bit_isset(bd_sizes[k].allocxor, bi/2)) {  // is buddy allocated?
       break;   // break out of loop
     }
     // budy is free; merge with buddy
@@ -229,7 +260,10 @@ bd_mark(void *start, void *stop)
         // if a block is allocated at size k, mark it as split too.
         bit_set(bd_sizes[k].split, bi);
       }
+      #ifdef XORTEST
       bit_set(bd_sizes[k].alloc, bi);
+      #endif
+      bit_flip(bd_sizes[k].allocxor, bi/2);
     }
   }
 }
@@ -237,16 +271,36 @@ bd_mark(void *start, void *stop)
 // If a block is marked as allocated and the buddy is free, put the
 // buddy on the free list at size k.
 int
-bd_initfree_pair(int k, int bi) {
+bd_initfree_pair(int k, int bi, int isleft) {
   int buddy = (bi % 2 == 0) ? bi+1 : bi-1;
+  int tofree;
+  if (isleft) {
+    tofree = bi < buddy ? buddy: bi;
+  } else {
+    tofree = bi < buddy ? bi: buddy;
+  }
   int free = 0;
-  if(bit_isset(bd_sizes[k].alloc, bi) !=  bit_isset(bd_sizes[k].alloc, buddy)) {
+  if(bit_isset(bd_sizes[k].allocxor, bi/2)) {
+#ifdef XORTEST
+    if(bit_isset(bd_sizes[k].alloc, bi) == bit_isset(bd_sizes[k].alloc, buddy)) {
+      panic("line 264");
+    }
+    int tofreecorrect = bit_isset(bd_sizes[k].alloc, bi)? buddy : bi;
+    if((tofree != tofreecorrect) && 1) {
+      printf("tofree %d, tofreecorrect %d, bi %d(a%d), buddy %d(a%d), isleft %d\n", tofree, tofreecorrect, bi, bit_isset(bd_sizes[k].alloc, bi), buddy, bit_isset(bd_sizes[k].alloc, buddy), isleft);
+      panic("line 267");
+    }
+#endif
     // one of the pair is free
     free = BLK_SIZE(k);
+#ifdef XORTEST
     if(bit_isset(bd_sizes[k].alloc, bi))
       lst_push(&bd_sizes[k].free, addr(k, buddy));   // put buddy on free list
     else
       lst_push(&bd_sizes[k].free, addr(k, bi));      // put bi on free list
+#else
+    lst_push(&bd_sizes[k].free, addr(k, tofree));   // put buddy on free list
+#endif
   }
   return free;
 }
@@ -261,10 +315,10 @@ bd_initfree(void *bd_left, void *bd_right) {
   for (int k = 0; k < MAXSIZE; k++) {   // skip max size
     int left = blk_index_next(k, bd_left);
     int right = blk_index(k, bd_right);
-    free += bd_initfree_pair(k, left);
+    free += bd_initfree_pair(k, left, 1);
     if(right <= left)
       continue;
-    free += bd_initfree_pair(k, right);
+    free += bd_initfree_pair(k, right, 0);
   }
   return free;
 }
@@ -314,12 +368,26 @@ bd_init(void *base, void *end) {
   p += sizeof(Sz_info) * nsizes;
   memset(bd_sizes, 0, sizeof(Sz_info) * nsizes);
 
-  // initialize free list and allocate the alloc array for each size k
+
   for (int k = 0; k < nsizes; k++) {
     lst_init(&bd_sizes[k].free);
+  }
+#ifdef XORTEST
+// initialize free list and allocate the alloc array for each size k
+  for (int k = 0; k < nsizes; k++) {
     sz = sizeof(char)* ROUNDUP(NBLK(k), 8)/8;
     bd_sizes[k].alloc = p;
     memset(bd_sizes[k].alloc, 0, sz);
+    p += sz;
+  }
+#endif
+
+  // initialize free list and allocate the allocxor array for each size k
+  for (int k = 0; k < nsizes; k++) {
+    sz = sizeof(char)* ROUNDUP(NBLK(k)/2, 8)/8;
+    // printf("k=%d,init %d\n",k, ROUNDUP(NBLK(k)/2, 8)/8);
+    bd_sizes[k].allocxor = p;
+    memset(bd_sizes[k].allocxor, 0, sz);
     p += sz;
   }
 
