@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -165,7 +167,9 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
       return -1;
     if(*pte & PTE_V)
       panic("remap");
-    *pte = PA2PTE(pa) | perm | PTE_V;
+    *pte = PA2PTE(pa) | perm;
+    if ((perm & PTE_L) == 0)
+      *pte |= PTE_V;
     if(a == last)
       break;
     a += PGSIZE;
@@ -183,19 +187,18 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
   uint64 a, last;
   pte_t *pte;
   uint64 pa;
-
   a = PGROUNDDOWN(va);
   last = PGROUNDDOWN(va + size - 1);
   for(;;){
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0){
-      printf("va=%p pte=%p\n", a, *pte);
+    if((*pte & (PTE_V | PTE_L)) == 0){
+      printf("in uvmunmap: va=%p pte=%p\n", a, *pte);
       panic("uvmunmap: not mapped");
     }
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
-    if(do_free){
+    if(do_free && ((*pte & PTE_L) == 0)){
       pa = PTE2PA(*pte);
       kfree((void*)pa);
     }
@@ -238,7 +241,7 @@ uvminit(pagetable_t pagetable, uchar *src, uint sz)
 // Allocate PTEs and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
-uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int lazy)
 {
   char *mem;
   uint64 a;
@@ -248,6 +251,16 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 
   oldsz = PGROUNDUP(oldsz);
   a = oldsz;
+  if (lazy) {
+    for(; a < newsz; a += PGSIZE){
+      mem = 0;
+      if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U|PTE_L) != 0){
+        return 0;
+      }
+    }
+    return newsz;
+  }
+  
   for(; a < newsz; a += PGSIZE){
     mem = kalloc();
     if(mem == 0){
@@ -327,6 +340,11 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
+    if(*pte & PTE_L) {
+      flags = PTE_FLAGS(*pte);
+      mappages(new, i, PGSIZE, 0, flags);
+      continue;
+    }
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
@@ -369,6 +387,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    lazyintr(pagetable, va0);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
@@ -394,6 +413,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
+    lazyintr(pagetable, va0);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
@@ -450,4 +470,58 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+void vmprint(pagetable_t pagetable){
+  printf("page table %p\n", (uint64)pagetable);
+  
+  void printrec(pagetable_t pagetable, int level) {
+    for (int i = 0; i < 256; i++) {
+      pte_t pte = pagetable[i];
+      if(pte & PTE_V) {
+        pagetable_t n_pagetable = (pagetable_t)PTE2PA(pte);
+        for (int l = level; l < 3 ; l++) {
+          printf(".. ");  
+        }        
+        printf("%d: pte %p (L:%d) (V:%d) pa %p\n", i, (uint64)pte, ((pte & PTE_L) != 0), (pte & PTE_V), (uint64)n_pagetable);
+        if (level > 0) {
+          printrec(n_pagetable, level-1);
+        }
+      }
+      if(pte & PTE_L) {
+        for (int l = level; l < 3 ; l++) {
+          printf(".. ");  
+        }        
+        printf("%d: pte %p (L:%d) (V:%d)\n", i, (uint64)pte, ((pte & PTE_L) != 0), (pte & PTE_V));
+      }
+    }
+  }
+
+
+  printrec(pagetable, 2);
+}
+
+int lazyintr(pagetable_t pagetable, uint64 va){
+  uint64 a = PGROUNDDOWN(va);
+  pte_t *pte;
+  
+  if(va >= MAXVA)
+    return 0;
+
+  if((pte = walk(pagetable, a, 0)) == 0)
+    return -1;
+  if((*pte & PTE_L) == 0){
+    // printf("in lazy intr %p\n", va);
+    // vmprint(p->pagetable);
+    return -1;
+  }
+    
+  // alloc page
+  void* mem = kalloc();
+  if(mem == 0){
+    return -1;
+  }
+  memset(mem, 0, PGSIZE);
+  *pte = PA2PTE(mem) | (*pte & ~PTE_L) | PTE_V;
+  return 0;
 }
