@@ -10,11 +10,19 @@
  * the kernel's page table.
  */
 
-#define MAXCOWPALIST 100000
-#define MAXCOWPADEP 1000
+struct palist {
+  uint64 pa;
+  uint refc;
+  struct palist* next;
+  struct palist* prev;
+};
+
+#define NPA 100000
 
 pagetable_t kernel_pagetable;
-pte_t* cowpalist[MAXCOWPALIST][MAXCOWPADEP];
+struct palist* pal;
+struct palist* freel;
+struct palist palists[NPA];
 
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
@@ -25,6 +33,13 @@ int addcow(pte_t* old_pte, pagetable_t new_table, uint64 va);
 int clearcow(pagetable_t pagetable, pte_t* pte);
 int cow(pagetable_t pagetable, uint64 va);
 
+void palist_init();
+struct palist* palist_find(uint64);
+int palist_add1(uint64);
+int palist_min1(uint64);
+void palist_print();
+struct palist* allocpal(void);
+void deallocpal(struct palist*);
 /*
  * create a direct-map page table for the kernel and
  * turn on paging. called early, in supervisor mode.
@@ -60,12 +75,6 @@ kvminit()
   // map the trampoline for trap entry/exit to
   // the highest virtual address in the kernel.
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
-
-  for (int i = 0; i < MAXCOWPALIST; i++) {
-    for (int j = 0; j < MAXCOWPADEP; j++) {
-      cowpalist[i][j] = 0;
-    }
-  }
 }
 
 // Switch h/w page table register to the kernel's page table,
@@ -211,10 +220,9 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
       panic("uvmunmap: not a leaf");
     if(do_free){
       pa = PTE2PA(*pte);
-      if (*pte & PTE_COW) {
+      if ((*pte & PTE_COW) && clearcow(pagetable, pte) > 0) {
         // if COW, don't free.
         // printf("uvmunmap ");
-        clearcow(pagetable, pte);
       } else {
         kfree((void*)pa);
       }
@@ -404,15 +412,8 @@ cow(pagetable_t pagetable, uint64 va)
   // using pa to find the rest ptes
   // if == 1
   // clear cow flag and markflag (call cow() on it.)
-  clearcow(pagetable, pte);
-  if(*pte & PTE_V) {
-    panic("not clear v");
-  }
-
-  if(*pte & PTE_COW) {
-    panic("not clear cow");
-  }
-
+  if (clearcow(pagetable, pte) == 0)
+    return 0;
   // alloc space for pa
   // change pte to point to new pa
   if((mem = kalloc()) == 0)
@@ -448,6 +449,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     // need to check if pa0 is writable
     // if not writable, then cow.
     // clear its pair if only one left.
+    if (va0 > MAXVA)
+      return -1;
     pte_t *pte = walk(pagetable, va0, 0);
     if (*pte & PTE_COW) {
       // printf("copy: ");
@@ -546,77 +549,18 @@ clearcow(pagetable_t pagetable, pte_t* pte){
   // printf("clearcow(pt %p,pte %p)\n", pagetable, *pte);
   // since pte memory will be remove shortly
   // clear pte COW FLAG, set unvalid tag
-  *pte = *pte & ~(PTE_COW|PTE_V);
   uint64 pa = PTE2PA(*pte);
-  int ti = -1;
-  // remove it from list.
-  for (int i = 0; i < MAXCOWPALIST; i++) {
-    pte_t* pte_p = cowpalist[i][0];
-    if (pte_p != 0 && PTE2PA(*pte_p) == pa) {
-      // found list head
-      ti = i;
-      break;
-    }
-  }
-  if (ti == -1)
-    panic("not found ti");
-
-  int count = 0;
-  int target = -1;
-  for (int j = 0; j < MAXCOWPADEP; j++) {
-    if (cowpalist[ti][j] != 0) {
-      count++;
-      if (cowpalist[ti][j] == pte) {
-        target = j;
-        // do it.
-        cowpalist[ti][j] = 0;
-      }
-    }
-  }
-  if (target == -1) {
-    panic("no target to clearcow");
-  }
-  if (count < 2) {
-    panic("too little entry to clearcow");
-  }
-  // if dup == 1, set the only one not COW
-  // clear this pte list.
-  // [[pte1, pte2, pte3, 0, 0]    these all point to a same pa.
-  // []]
-  if (count == 2) {
-    // printf("clear cow - count == 2, remove last\n");
-    for (int j = 0; j < MAXCOWPADEP; j++) {
-      if (cowpalist[ti][j] != 0) {
-        pte_t* pteclear = cowpalist[ti][j];
-        if ((*pteclear & PTE_COW) == 0) {
-          panic("cow not found");
-        }
-        if (PTE2PA(*pte) != PTE2PA(*pteclear)) {
-          panic("pa not eq");
-        }
-        *pteclear = *pteclear & ~(PTE_COW);
-        // if (*pteclear & PTE_COW_W) {
-          *pteclear = *pteclear | PTE_W;
-        // }
-        cowpalist[ti][j] = 0;
-      }
-    }
-    return 2;
+  int ref = palist_min1(pa);
+  if (ref == 0) {
+    // mark as valid, use it directly
+    *pte = (*pte & ~PTE_COW) | PTE_W;
+  } else if (ref > 0) {
+    // mark as invalid, alloc later.
+    *pte = *pte & ~(PTE_COW|PTE_V);
   } else {
-    // move a valid pointer to the first, to represent this list.
-    if (cowpalist[ti][0] == 0) {
-      for (int j = 0; j < MAXCOWPADEP; j++) {
-        if (cowpalist[ti][j] != 0) {
-          cowpalist[ti][0] = cowpalist[ti][j];
-          cowpalist[ti][j] = 0;
-          break;
-        }
-      }
-    }
-    return 1;
+    panic("pa ref < 0");
   }
-  panic("remove no cow");
-  return 0;
+  return ref;
 }
 
 // change parent's pte and child's pet
@@ -625,36 +569,20 @@ clearcow(pagetable_t pagetable, pte_t* pte){
 // return -1 failed
 int
 addcow(pte_t* old_pte, pagetable_t new_table, uint64 va) {
-  int found = 0;
+  uint64 pa = PTE2PA(*old_pte);
   if((*old_pte & PTE_COW) == 0) {
     // mark parent cow
-    *old_pte  = *old_pte | PTE_COW;
-    // if (*old_pte & PTE_W)
-    //   *old_pte  = *old_pte | PTE_COW_W;
-    *old_pte  = *old_pte & ~PTE_W;
+    *old_pte  = (*old_pte & ~PTE_W) | PTE_COW;
     // printf("addcow(opte %p) pa:%p\n", *old_pte, PTE2PA(*old_pte));
     // add parent pte into list
     // this is a first entry
-    for (int i=0;i<MAXCOWPALIST;i++) {
-      if (cowpalist[i][0] == 0) {
-        cowpalist[i][0] = old_pte;
-        found = 1;
-        break;
-      }
-    }
-    if (!found) {
-      // for (int i=0;i<MAXCOWPALIST;i++) {
-      //   printf("%p\n", cowpalist[i][0]);
-      // }
-      vmprint(new_table);
-      panic("add parent overflow failed");
-      return -1;
-    }
-
+    palist_add1(pa);
   }
 
   // copy parent pte
   pte_t *pte;
+  if(va >= MAXVA)
+    return -1;
   if((pte = walk(new_table, va, 1)) == 0)
       return -1;
   if(*pte & PTE_V)
@@ -662,32 +590,16 @@ addcow(pte_t* old_pte, pagetable_t new_table, uint64 va) {
   *pte = *old_pte;
   // printf("addcow( pte %p, pt %p)\n", *pte, new_table);
   // add child pte into list
-  for (int i=0;i<MAXCOWPALIST;i++) {
-    pte_t* pte_p = cowpalist[i][0];
-    if (pte_p != 0 && PTE2PA(*pte_p) == PTE2PA(*pte)) {
-      // found list head
-      for (int j=0;j<MAXCOWPADEP;j++) {
-        if (cowpalist[i][j] == 0) {
-          cowpalist[i][j] = pte;
-          return 0;
-        }
-      }
-    }
-  }
+  if (palist_add1(pa) > 1)
+    return 0;
   vmprint(new_table);
-  panic("child overflow not found");
+  panic("add cow ref count < 2");
   return -1;
 }
 
 
 void vmprint(pagetable_t pagetable){
-  for (int i=0;i<10;i++) {
-    for (int j=0;j<MAXCOWPADEP; j++) {
-      // printf("%p(%p) ",cowpalist[i][j],*cowpalist[i][j]);
-      printf("%p ",cowpalist[i][j]);
-    }
-    printf("\n");
-  }
+  palist_print(pal);
   
   printf("page table %p\n", (uint64)pagetable);
   
@@ -707,4 +619,103 @@ void vmprint(pagetable_t pagetable){
     }
   }
   printrec(pagetable, 2);
+}
+
+void
+palist_init() {
+    pal = palists;
+    freel = palists + 1;
+    pal->next = pal;
+    pal->prev = pal;
+    pal->pa = 0;
+    pal->refc = 0;
+    freel->next = freel;
+    freel->prev = freel;
+    struct palist* p;    
+    for(int i=2;i<NPA;i++) {
+      p = palists + i;
+      p->next = freel->next;
+      p->prev = freel;
+      p->next->prev = p;
+      p->prev->next = p;
+    }
+}
+
+struct palist* palist_find(uint64 pa) {
+    if (pa == 0) {
+      panic("can't be 0");
+    }
+    if (pal == 0) {
+      palist_init();
+    }
+    struct palist* pl = pal;
+    for (;;){
+      pl = pl->next;
+      if (pl->pa == pa)
+          return pl;
+      if (pl == pal)
+        break;
+    }
+    return 0;
+}
+
+int palist_add1(uint64 pa) {
+    if (pal == 0) {
+      palist_init();
+    }
+    struct palist* pl = palist_find(pa);
+    if (pl == 0) {
+      // insert
+      pl = allocpal();
+      pl->pa = pa;
+      pl->refc = 0;
+      pl->next = pal->next;
+      pl->prev = pal;
+
+      pl->next->prev = pl;
+      pl->prev->next = pl;
+    }
+    return ++(pl->refc);
+}
+
+int palist_min1(uint64 pa) {
+    struct palist* pl = palist_find(pa);
+    if (pl == 0)
+      panic("didn't find pa in pal");
+    int refc = --(pl->refc);
+    if (refc == 0) {
+      pl->next->prev = pl->prev;
+      pl->prev->next = pl->next;
+      deallocpal(pl);
+    }
+    return refc;
+}
+
+void palist_print() {
+    struct palist* pl = pal->next;
+    while(pl != pal) {
+        printf("pa: %p, refc: %d\n", pl->pa, pl->refc);
+        pl = pl->next;
+    }
+}
+
+
+struct palist*
+allocpal()
+{
+  if (freel->next == freel)
+    panic("free list empty");
+  struct palist* p = freel->next;
+  p->next->prev = p->prev;
+  p->prev->next = p->next;
+  return p;
+}
+
+void
+deallocpal(struct palist* freepa)
+{
+  freepa->next = freel->next;
+  freepa->prev = freel;
+  freepa->next->prev = freepa;
+  freepa->prev->next = freepa;
 }
