@@ -9,13 +9,21 @@
 /*
  * the kernel's page table.
  */
+
+#define MAXCOWPALIST 100000
+#define MAXCOWPADEP 1000
+
 pagetable_t kernel_pagetable;
+pte_t* cowpalist[MAXCOWPALIST][MAXCOWPADEP];
 
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
 void print(pagetable_t);
+int addcow(pte_t* old_pte, pagetable_t new_table, uint64 va);
+int clearcow(pagetable_t pagetable, pte_t* pte);
+int cow(pagetable_t pagetable, uint64 va);
 
 /*
  * create a direct-map page table for the kernel and
@@ -52,6 +60,12 @@ kvminit()
   // map the trampoline for trap entry/exit to
   // the highest virtual address in the kernel.
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  for (int i = 0; i < MAXCOWPALIST; i++) {
+    for (int j = 0; j < MAXCOWPADEP; j++) {
+      cowpalist[i][j] = 0;
+    }
+  }
 }
 
 // Switch h/w page table register to the kernel's page table,
@@ -197,7 +211,13 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
       panic("uvmunmap: not a leaf");
     if(do_free){
       pa = PTE2PA(*pte);
-      kfree((void*)pa);
+      if (*pte & PTE_COW) {
+        // if COW, don't free.
+        // printf("uvmunmap ");
+        clearcow(pagetable, pte);
+      } else {
+        kfree((void*)pa);
+      }
     }
     *pte = 0;
     if(a == last)
@@ -240,6 +260,7 @@ uvminit(pagetable_t pagetable, uchar *src, uint sz)
 uint64
 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 {
+  // printf("uvmalloc pt: %p, %p, %p\n", pagetable, oldsz, newsz);
   char *mem;
   uint64 a;
 
@@ -320,30 +341,22 @@ int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
-  uint64 pa, i;
-  uint flags;
-  char *mem;
+  uint64 i;
+
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
-    pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
-    }
+    
+    // COW
+    // here don't kalloc
+    // change parent's pte and child's pet
+    // maintain pa to pte list map.
+    addcow(pte, new, i);
   }
   return 0;
-
- err:
-  uvmunmap(new, 0, i, 1);
-  return -1;
 }
 
 // mark a PTE invalid for user access.
@@ -359,6 +372,67 @@ uvmclear(pagetable_t pagetable, uint64 va)
   *pte &= ~PTE_U;
 }
 
+// Copy a page on write
+int
+cow(pagetable_t pagetable, uint64 va)
+{
+  // printf("cow(pt %p,va %p) ",pagetable, va);
+  va = PGROUNDDOWN(va);
+  // printf("-cow(pt %p,va %p)\n",pagetable, va);
+  // check cow flag
+  // using pa to find the rest ptes
+  // if == 1
+  // clear cow flag and markflag (call cow() on it.)
+  // alloc space for pa
+  // change pte to point to new pa
+  // remove pte's write mark and cow mark
+  uint64 pa;
+  uint flags;
+  char *mem;
+  pte_t *pte;
+
+  // check cow flag
+  pte = walk(pagetable, va, 0);
+  if (!(*pte & PTE_COW)) {
+    // panic("no cow in cow");
+    return -1;
+  }
+  // if (!(*pte & PTE_COW_W)) {
+  //   panic("previously not writable");
+  // }
+
+  // using pa to find the rest ptes
+  // if == 1
+  // clear cow flag and markflag (call cow() on it.)
+  clearcow(pagetable, pte);
+  if(*pte & PTE_V) {
+    panic("not clear v");
+  }
+
+  if(*pte & PTE_COW) {
+    panic("not clear cow");
+  }
+
+  // alloc space for pa
+  // change pte to point to new pa
+  if((mem = kalloc()) == 0)
+    goto err;
+
+  pa = PTE2PA(*pte);
+  memmove(mem, (char*)pa, PGSIZE);
+  // remove pte's write mark and cow mark
+  // flags = (PTE_FLAGS(*pte) | PTE_W | PTE_V ) & ~PTE_COW & ~PTE_COW_W;
+  flags = (PTE_FLAGS(*pte) | PTE_W | PTE_V ) & ~PTE_COW;
+  if(mappages(pagetable, va, PGSIZE, (uint64)mem, flags) != 0){
+    kfree(mem);
+    goto err;
+  }
+  return 0;
+err:
+  return -1;
+}
+
+
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
@@ -369,6 +443,17 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    
+    // COW
+    // need to check if pa0 is writable
+    // if not writable, then cow.
+    // clear its pair if only one left.
+    pte_t *pte = walk(pagetable, va0, 0);
+    if (*pte & PTE_COW) {
+      // printf("copy: ");
+      cow(pagetable, dstva);
+    }
+
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
@@ -450,4 +535,176 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// return how much COW is cleared.
+// clear pte COW FLAG, set unvalid tag
+// remove it from list.
+// if dup == 1, del the only one from COW
+int
+clearcow(pagetable_t pagetable, pte_t* pte){
+  // printf("clearcow(pt %p,pte %p)\n", pagetable, *pte);
+  // since pte memory will be remove shortly
+  // clear pte COW FLAG, set unvalid tag
+  *pte = *pte & ~(PTE_COW|PTE_V);
+  uint64 pa = PTE2PA(*pte);
+  int ti = -1;
+  // remove it from list.
+  for (int i = 0; i < MAXCOWPALIST; i++) {
+    pte_t* pte_p = cowpalist[i][0];
+    if (pte_p != 0 && PTE2PA(*pte_p) == pa) {
+      // found list head
+      ti = i;
+      break;
+    }
+  }
+  if (ti == -1)
+    panic("not found ti");
+
+  int count = 0;
+  int target = -1;
+  for (int j = 0; j < MAXCOWPADEP; j++) {
+    if (cowpalist[ti][j] != 0) {
+      count++;
+      if (cowpalist[ti][j] == pte) {
+        target = j;
+        // do it.
+        cowpalist[ti][j] = 0;
+      }
+    }
+  }
+  if (target == -1) {
+    panic("no target to clearcow");
+  }
+  if (count < 2) {
+    panic("too little entry to clearcow");
+  }
+  // if dup == 1, set the only one not COW
+  // clear this pte list.
+  // [[pte1, pte2, pte3, 0, 0]    these all point to a same pa.
+  // []]
+  if (count == 2) {
+    // printf("clear cow - count == 2, remove last\n");
+    for (int j = 0; j < MAXCOWPADEP; j++) {
+      if (cowpalist[ti][j] != 0) {
+        pte_t* pteclear = cowpalist[ti][j];
+        if ((*pteclear & PTE_COW) == 0) {
+          panic("cow not found");
+        }
+        if (PTE2PA(*pte) != PTE2PA(*pteclear)) {
+          panic("pa not eq");
+        }
+        *pteclear = *pteclear & ~(PTE_COW);
+        // if (*pteclear & PTE_COW_W) {
+          *pteclear = *pteclear | PTE_W;
+        // }
+        cowpalist[ti][j] = 0;
+      }
+    }
+    return 2;
+  } else {
+    // move a valid pointer to the first, to represent this list.
+    if (cowpalist[ti][0] == 0) {
+      for (int j = 0; j < MAXCOWPADEP; j++) {
+        if (cowpalist[ti][j] != 0) {
+          cowpalist[ti][0] = cowpalist[ti][j];
+          cowpalist[ti][j] = 0;
+          break;
+        }
+      }
+    }
+    return 1;
+  }
+  panic("remove no cow");
+  return 0;
+}
+
+// change parent's pte and child's pet
+// maintain pa to pte list map.
+// return 0 success
+// return -1 failed
+int
+addcow(pte_t* old_pte, pagetable_t new_table, uint64 va) {
+  int found = 0;
+  if((*old_pte & PTE_COW) == 0) {
+    // mark parent cow
+    *old_pte  = *old_pte | PTE_COW;
+    // if (*old_pte & PTE_W)
+    //   *old_pte  = *old_pte | PTE_COW_W;
+    *old_pte  = *old_pte & ~PTE_W;
+    // printf("addcow(opte %p) pa:%p\n", *old_pte, PTE2PA(*old_pte));
+    // add parent pte into list
+    // this is a first entry
+    for (int i=0;i<MAXCOWPALIST;i++) {
+      if (cowpalist[i][0] == 0) {
+        cowpalist[i][0] = old_pte;
+        found = 1;
+        break;
+      }
+    }
+    if (!found) {
+      // for (int i=0;i<MAXCOWPALIST;i++) {
+      //   printf("%p\n", cowpalist[i][0]);
+      // }
+      vmprint(new_table);
+      panic("add parent overflow failed");
+      return -1;
+    }
+
+  }
+
+  // copy parent pte
+  pte_t *pte;
+  if((pte = walk(new_table, va, 1)) == 0)
+      return -1;
+  if(*pte & PTE_V)
+    panic("add cow remap");
+  *pte = *old_pte;
+  // printf("addcow( pte %p, pt %p)\n", *pte, new_table);
+  // add child pte into list
+  for (int i=0;i<MAXCOWPALIST;i++) {
+    pte_t* pte_p = cowpalist[i][0];
+    if (pte_p != 0 && PTE2PA(*pte_p) == PTE2PA(*pte)) {
+      // found list head
+      for (int j=0;j<MAXCOWPADEP;j++) {
+        if (cowpalist[i][j] == 0) {
+          cowpalist[i][j] = pte;
+          return 0;
+        }
+      }
+    }
+  }
+  vmprint(new_table);
+  panic("child overflow not found");
+  return -1;
+}
+
+
+void vmprint(pagetable_t pagetable){
+  for (int i=0;i<10;i++) {
+    for (int j=0;j<MAXCOWPADEP; j++) {
+      // printf("%p(%p) ",cowpalist[i][j],*cowpalist[i][j]);
+      printf("%p ",cowpalist[i][j]);
+    }
+    printf("\n");
+  }
+  
+  printf("page table %p\n", (uint64)pagetable);
+  
+  void printrec(pagetable_t pagetable, int level) {
+    for (int i = 0; i < 256; i++) {
+      pte_t pte = pagetable[i];
+      if(pte & PTE_V) {
+        pagetable_t n_pagetable = (pagetable_t)PTE2PA(pte);
+        for (int l = level; l < 3 ; l++) {
+          printf(".. ");  
+        }        
+        printf("%d: pte %p (C:%d) (V:%d) pa %p\n", i, (uint64)pte, ((pte & PTE_COW) != 0), (pte & PTE_V), (uint64)n_pagetable);
+        if (level > 0) {
+          printrec(n_pagetable, level-1);
+        }
+      }
+    }
+  }
+  printrec(pagetable, 2);
 }
